@@ -86,6 +86,7 @@
 
   let weekOffset = 0;
 
+  // ── Auth guard ────────────────────────────────────────────────
   onAuthStateChanged(auth, async (user) => {
     if (!user) { window.location.href = "index.html"; return; }
     
@@ -101,6 +102,9 @@
     await loadWeeklyStatistics(user.uid);
   });
 
+  // ── Helper functions ──────────────────────────────────────────
+
+  // Returns the Sunday of the week that is (offset) weeks away from today.
   function getStartDateOfWeek(offset) {
       const d = new Date();
       const day = d.getDay();
@@ -110,12 +114,15 @@
       return res;
   }
 
+  // Converts a time string to total minutes
   function timeToMinutes(t) { const [h, m] = t.split(':').map(Number); return h * 60 + m; }
-  function minutesToTime(m) {
-    const h = Math.floor(m / 60); const min = Math.round(m % 60);
-    return `${h.toString().padStart(2, '0')}:${min.toString().padStart(2, '0')}`;
+
+  // Formats a Date object as "YYYY-MM-DD"
+  function normalizeDate(date) {
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
   }
 
+  // ── Load weekly statistics ────────────────────────────────────
   async function loadWeeklyStatistics(userId) {
     try {
       const startDate = getStartDateOfWeek(weekOffset);
@@ -123,91 +130,141 @@
       endDate.setDate(startDate.getDate() + 6);
       endDate.setHours(23, 59, 59, 999);
 
+      // Update the week label in the header
       document.getElementById("stats-week-label").textContent =
         `${startDate.toLocaleDateString('en-US', {month:'short', day:'numeric'})} - ${endDate.toLocaleDateString('en-US', {month:'short', day:'numeric'})}`;
 
-      const [coursesSnap, availSnap, deadlineSnap] = await Promise.all([
-        getDocs(collection(db, "users", userId, "courses")),
-        getDocs(collection(db, "users", userId, "availability")),
-        getDocs(collection(db, "users", userId, "deadlines"))
-      ]);
+      // Load courses, availability, and deadlines from Firestore
+      const coursesSnap  = await getDocs(collection(db, "users", userId, "courses"));
+      const availSnap    = await getDocs(collection(db, "users", userId, "availability"));
+      const deadlineSnap = await getDocs(collection(db, "users", userId, "deadlines"));
 
-      // Build courseStats map
+      // Build courseStats 
       const courseStats = {};
-      coursesSnap.forEach(c => {
-        const code = c.data().code;
-        courseStats[code] = { done: 0, total: 0 };
+      coursesSnap.forEach(function(c) {
+        courseStats[c.data().code] = { done: 0, total: 0 };
       });
 
-      // Build availability and deadlines arrays
       const availability = [];
-      availSnap.forEach(av => availability.push(av.data()));
+      availSnap.forEach(function(av) { availability.push(av.data()); });
 
       const allDeadlines = [];
-      deadlineSnap.forEach(d => allDeadlines.push({ id: d.id, ...d.data() }));
+      deadlineSnap.forEach(function(d) { allDeadlines.push({ id: d.id, ...d.data() }); });
 
       let totalExpectedInWeek = 0;
       let totalAvailableMinutes = 0;
       let completedInWeek = 0;
       let missedInWeek = 0;
 
-      // Calculate total available hours (same logic as study-plan)
-      availability.forEach(({ day, from, to }) => {
-        const duration = timeToMinutes(to) - timeToMinutes(from);
-        const multiplier = (day === "Every Day") ? 7 : 1;
+      // Calculate total available study hours for the stat card
+      for (let i = 0; i < availability.length; i++) {
+        const slot = availability[i];
+        const duration = timeToMinutes(slot.to) - timeToMinutes(slot.from);
+        if (duration <= 0) continue;
+    
+        const multiplier = (slot.day === "Every Day") ? 7 : 1;
         totalAvailableMinutes += duration * multiplier;
-      });
+      }
 
-      // Simulate the same session generation logic as study-plan.html
       const daysOfWeek = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
-      let queueIndex = 0;
 
-      daysOfWeek.forEach((dayName, colIdx) => {
+      // alreadyCounted prevents us from counting the same session twice
+      const alreadyCounted = {};
+
+      for (let colIdx = 0; colIdx < daysOfWeek.length; colIdx++) {
+        const dayName = daysOfWeek[colIdx];
+
         const currentDayDate = new Date(startDate);
         currentDayDate.setDate(startDate.getDate() + colIdx);
-        currentDayDate.setHours(0,0,0,0);
+        currentDayDate.setHours(0, 0, 0, 0);
 
-        const daySlots = availability.filter(s => s.day === dayName || s.day === "Every Day");
+        const dateStr = normalizeDate(currentDayDate);
 
-        daySlots.forEach(slot => {
-          const duration = timeToMinutes(slot.to) - timeToMinutes(slot.from);
-          const numSessions = duration > 100 ? 2 : 1;
-          const minsPerSession = duration / numSessions;
+        // ── Step 1: Count regular sessions ───────────────────────
+        // Note: unlike the study plan display, we count ALL days in the
+        // week (past and future) so the total matches what was scheduled.
+        const daySlots = availability.filter(function(s) {
+          return s.day === dayName || s.day === "Every Day";
+        });
 
-          for (let i = 0; i < numSessions; i++) {
-            const activeTasks = allDeadlines.filter(t => {
-              const dueDate = new Date(t.dueDate);
-              dueDate.setHours(0,0,0,0);
-              return currentDayDate < dueDate;
-            });
+        for (let si = 0; si < daySlots.length; si++) {
+          const slot = daySlots[si];
 
-            if (activeTasks.length === 0) continue;
+          // Find tasks that had a session on this day
+          // (due date is in the future relative to this day, and not yet completed)
+          const tasksForDay = allDeadlines.filter(function(task) {
+            if (!task.dueDate) return false;
+            const dueDate = new Date(task.dueDate + "T00:00:00");
+            dueDate.setHours(0, 0, 0, 0);
+            return currentDayDate < dueDate && task.status !== "completed";
+          });
 
-            const task = activeTasks[queueIndex % activeTasks.length];
-            queueIndex++;
+          if (tasksForDay.length === 0) continue;
 
-            totalExpectedInWeek++;
+          const slotDuration = timeToMinutes(slot.to) - timeToMinutes(slot.from);
+          if (slotDuration <= 0) continue;
 
-            const sessionStart = minutesToTime(timeToMinutes(slot.from) + (i * minsPerSession));
-            const dateStr = currentDayDate.toISOString().split('T')[0];
-            const sessionKey = `${dateStr}_${sessionStart}_${task.courseCode}`;
+          for (let ti = 0; ti < tasksForDay.length; ti++) {
+            const task = tasksForDay[ti];
+
+            const sessionKey = `${dateStr}_${slot.from}_${task.courseCode}`;
             const sessionStates = task.sessionStates || {};
             const status = sessionStates[sessionKey] || "default";
 
-            const courseCode = task.courseCode;
-            if (courseStats[courseCode]) {
-              courseStats[courseCode].total++;
+            // Skip slots that were reassigned when a deadline was marked Done
+            if (status === "reassigned") continue;
+
+            // Avoid double-counting the same session
+            const trackingKey = task.id + "_" + sessionKey;
+            if (alreadyCounted[trackingKey]) continue;
+            alreadyCounted[trackingKey] = true;
+
+            totalExpectedInWeek++;
+            if (courseStats[task.courseCode]) {
+              courseStats[task.courseCode].total++;
               if (status === "completed") {
-                courseStats[courseCode].done++;
+                courseStats[task.courseCode].done++;
                 completedInWeek++;
               } else if (status === "missed") {
                 missedInWeek++;
               }
             }
           }
-        });
-      });
+        }
 
+        // ── Step 2: Count bonus sessions ──────────────────────────
+        for (let di = 0; di < allDeadlines.length; di++) {
+          const task = allDeadlines[di];
+          if (task.status === "completed") continue;
+
+          const sessionStates = task.sessionStates || {};
+          const bonusKey = `${dateStr}_bonus_${task.courseCode}`;
+
+          // Check if a bonus session exists for this task on this day
+          if (bonusKey in sessionStates) {
+            const status = sessionStates[bonusKey];
+            if (status === "reassigned") continue;
+
+            // Skip if already counted
+            const trackingKey = task.id + "_" + bonusKey;
+            if (alreadyCounted[trackingKey]) continue;
+            alreadyCounted[trackingKey] = true;
+
+            totalExpectedInWeek++;
+            if (courseStats[task.courseCode]) {
+              courseStats[task.courseCode].total++;
+              if (status === "completed") {
+                courseStats[task.courseCode].done++;
+                completedInWeek++;
+              } else if (status === "missed") {
+                missedInWeek++;
+              }
+            }
+          }
+        }
+      }
+
+      // ── Update the four stat cards ────────────────────────────
       document.getElementById("stat-total-sessions").textContent = totalExpectedInWeek;
       document.getElementById("stat-missed-sessions").textContent = missedInWeek;
       document.getElementById("stat-total-hours").textContent = `${(totalAvailableMinutes / 60).toFixed(1)}h`;
@@ -221,12 +278,14 @@
     } catch (e) { console.error("Progress Analysis Error:", e); }
   }
 
+  // ── Render progress bars ──────────────────────────────────────
   function renderCourseBars(stats) {
     const container = document.getElementById("course-progress-list");
     container.innerHTML = "";
 
     Object.keys(stats).forEach(code => {
-      const { done, total } = stats[code];
+      const done  = stats[code].done;
+      const total = stats[code].total;
       const percent = total > 0 ? Math.round((done / total) * 100) : 0;
 
       const div = document.createElement("div");
@@ -248,6 +307,7 @@
     });
   }
 
+  // ── Week navigation & logout ──────────────────────────────────
   document.getElementById("prev-week-stats").onclick = () => { weekOffset--; loadWeeklyStatistics(auth.currentUser.uid); };
   document.getElementById("next-week-stats").onclick = () => { weekOffset++; loadWeeklyStatistics(auth.currentUser.uid); };
   document.getElementById("logout-btn").onclick = async () => { await signOut(auth); window.location.href = "index.html"; };
