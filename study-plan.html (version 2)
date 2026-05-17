@@ -23,7 +23,7 @@
     <a class="nav-item" href="progress.html">Progress</a>
     <a class="nav-item" href="reminders.html">Reminders</a>
     <a class="nav-item" href="chatbot.html">Chat With AI</a>
-    
+
     <div class="sidebar-user">
       <div class="user-avatar" id="sidebar-initial">S</div>
       <div class="user-details">
@@ -124,19 +124,24 @@
   import {
     collection,
     getDocs,
+    getDocsFromServer,
+    getDocFromServer,
     addDoc,
     deleteDoc,
     doc,
     query,
     orderBy,
     getDoc,
-    updateDoc
+    updateDoc,
+    deleteField
   } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
   // ── Global state ──────────────────────────────────────────────
   let currentUser = null;
   let currentAvailability = [];
   let weekOffset = 0;
+  // Prevents a second toggle firing before the first finishes re-rendering.
+  let isProcessing = false;
 
   // The three states a session card can be in.
   const STATE_CYCLE = ["default", "completed", "missed"];
@@ -178,10 +183,12 @@
     return h * 60 + m;
   }
 
-  // Converts a number of minutes back to a time string
+  // Converts a number of minutes back to a time string.
+  // Wraps at 1440 so midnight (1440 min) correctly shows as "00:00"
   function minutesToTime(totalMinutes) {
-    const h = Math.floor(totalMinutes / 60);
-    const m = Math.round(totalMinutes % 60);
+    const wrapped = totalMinutes % 1440;
+    const h = Math.floor(wrapped / 60);
+    const m = Math.round(wrapped % 60);
     return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}`;
   }
 
@@ -216,6 +223,10 @@
 
   // ── Session state toggling ────────────────────────────────────
   async function toggleSessionState(taskId, sessionKey, currentState) {
+    // Ignore rapid clicks while the previous toggle is still saving + re-rendering.
+    if (isProcessing) return;
+    isProcessing = true;
+
     const currentIndex = STATE_CYCLE.indexOf(currentState);
     const safeIndex = currentIndex === -1 ? 0 : currentIndex;
     const nextState = STATE_CYCLE[(safeIndex + 1) % STATE_CYCLE.length];
@@ -226,22 +237,75 @@
         [`sessionStates.${sessionKey}`]: nextState
       });
 
-      // If the session was marked as missed, find the next free slot and add a replacement session there.
+      // If the session is being changeed from missed to default
+      // remove the bonus replacement session that was created for it.
+      if (currentState === "missed" && nextState === "default") {
+        await removeRescheduledSession(taskId, sessionKey);
+      }
+
+      // If the session was marked as missed, find the next free slot
+      // and add a replacement session there.
       if (nextState === "missed") {
         await rescheduleAfterMiss(taskId, sessionKey);
       }
-
-      await generateStudyPlan();
     } catch (err) {
+      // Log the error but still fall through to the finally block
+      // so the UI always re-renders from the latest Firestore state.
       console.error("Failed to update session state:", err);
+    } finally {
+      // Always re-render — even if reschedule helpers fail, the main
+      // state change in Firestore already succeeded and the card must
+      // reflect it, otherwise it appears permanently stuck.
+      await generateStudyPlan();
+      isProcessing = false;
+    }
+  }
+
+  // ── Remove bonus session when un-missing ──────────────────────
+  async function removeRescheduledSession(taskId, missedSessionKey) {
+    try {
+      const taskSnap = await getDocFromServer(doc(db, "users", currentUser.uid, "deadlines", taskId));
+      if (!taskSnap.exists()) return;
+      const task = taskSnap.data();
+      const sessionStates = task.sessionStates || {};
+
+      // Extract the missed date and course code from the session key.
+      // Key format: "YYYY-MM-DD_HH:MM_COURSECODE"
+      const parts = missedSessionKey.split("_");
+      const missedDateStr = parts[0];
+      // Course code is everything after the first two segments
+      const courseCode = parts.slice(2).join("_");
+      const missedDate = new Date(missedDateStr + "T00:00:00");
+
+      // Find the bonus key that was scheduled after the missed date
+      // for the same course code and delete it.
+      const updates = {};
+      for (const key of Object.keys(sessionStates)) {
+        if (key.includes(`_bonus_${courseCode}`)) {
+          const bonusDateStr = key.split("_")[0];
+          const bonusDate = new Date(bonusDateStr + "T00:00:00");
+          if (bonusDate > missedDate) {
+            updates[`sessionStates.${key}`] = deleteField();
+            // Only remove the first matching bonus (one miss = one bonus)
+            break;
+          }
+        }
+      }
+
+      if (Object.keys(updates).length > 0) {
+        await updateDoc(doc(db, "users", currentUser.uid, "deadlines", taskId), updates);
+      }
+    } catch (err) {
+      console.error("Remove rescheduled session failed:", err);
     }
   }
 
   // ── Automatic rescheduling ──────────────────────────────────────
   async function rescheduleAfterMiss(taskId, missedSessionKey) {
     try {
-      // Load fresh data for this deadline from Firestore
-      const taskSnap = await getDoc(doc(db, "users", currentUser.uid, "deadlines", taskId));
+      // Load fresh data from the server (not cache) so we see the most
+      // recent sessionStates before deciding where to place the bonus.
+      const taskSnap = await getDocFromServer(doc(db, "users", currentUser.uid, "deadlines", taskId));
       if (!taskSnap.exists()) return;
       const task = taskSnap.data();
 
@@ -258,11 +322,18 @@
       // Get the current saved session states so we don't book a slot twice
       const sessionStates = task.sessionStates || {};
 
+      // Today midnight — bonus sessions must never land in the past.
+      const todayMidnight = new Date();
+      todayMidnight.setHours(0, 0, 0, 0);
+
       // Search the next 14 days after the missed session for a free slot
       for (let offset = 1; offset <= 14; offset++) {
         const candidateDay = new Date(missedDate);
         candidateDay.setDate(missedDate.getDate() + offset);
         candidateDay.setHours(0, 0, 0, 0);
+
+        // Never schedule a bonus in the past — skip silently.
+        if (candidateDay < todayMidnight) continue;
 
         // Stop searching if we've reached or passed the deadline's due date
         const dueDate = new Date(task.dueDate + "T00:00:00");
@@ -272,7 +343,8 @@
         const dayName = daysOfWeek[candidateDay.getDay()];
         const dateStr = normalizeDate(candidateDay);
 
-        // Check if this day has any availability
+        // Check if this day has any availability — "Every Day" counts for
+        // whatever day of the week the candidate falls on.
         const hasAvailability = currentAvailability.some(s => {
           return s.day === dayName || s.day === "Every Day";
         });
@@ -295,6 +367,99 @@
     }
   }
 
+  // ── Auto-miss: mark past uncompleted sessions as missed ───────
+  async function autoMarkMissedSessions(allDeadlines) {
+    const now = new Date();
+    const todayMidnight = new Date(now);
+    todayMidnight.setHours(0, 0, 0, 0);
+    const nowMinutes = now.getHours() * 60 + now.getMinutes();
+    const daysOfWeek = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+    const todayDayName = daysOfWeek[todayMidnight.getDay()];
+
+    for (const task of allDeadlines) {
+      // Never touch tasks already marked as Done
+      if (task.status === "completed") continue;
+
+      const sessionStates = task.sessionStates || {};
+      const updates = {};
+
+      const dueDate = new Date(task.dueDate + "T00:00:00");
+      dueDate.setHours(0, 0, 0, 0);
+
+      for (const slot of currentAvailability) {
+        // Work out when this slot ends in minutes (handle midnight = 1440)
+        let slotEndMinutes = timeToMinutes(slot.to);
+        if (slotEndMinutes === 0) slotEndMinutes = 1440;
+        if (slotEndMinutes <= timeToMinutes(slot.from)) slotEndMinutes += 1440;
+
+        // ── Check today: if this slot applies today and has already ended ──
+        const appliesToday = (slot.day === "Every Day" || slot.day === todayDayName);
+        if (appliesToday && slotEndMinutes <= nowMinutes) {
+          if (todayMidnight < dueDate) {
+            const dateStr = normalizeDate(todayMidnight);
+            const sessionKey = `${dateStr}_${slot.from}_${task.courseCode}`;
+            const state = sessionStates[sessionKey];
+            if (!state || state === "default") {
+              updates[`sessionStates.${sessionKey}`] = "missed";
+            }
+          }
+        }
+
+        // ── Check past days (up to 14 days back) ─────────────────────────
+        for (let daysBack = 1; daysBack <= 14; daysBack++) {
+          const pastDay = new Date(todayMidnight);
+          pastDay.setDate(todayMidnight.getDate() - daysBack);
+          pastDay.setHours(0, 0, 0, 0);
+
+          const pastDayName = daysOfWeek[pastDay.getDay()];
+
+          // Does this slot apply to that past day?
+          if (slot.day !== "Every Day" && slot.day !== pastDayName) continue;
+
+          // Was the task's deadline still in the future on that day?
+          if (pastDay >= dueDate) continue;
+
+          const dateStr = normalizeDate(pastDay);
+          const sessionKey = `${dateStr}_${slot.from}_${task.courseCode}`;
+          const state = sessionStates[sessionKey];
+
+          if (!state || state === "default") {
+            updates[`sessionStates.${sessionKey}`] = "missed";
+          }
+        }
+      }
+
+      // ── Check past bonus sessions ─────────────────────────────────────
+      for (const key of Object.keys(sessionStates)) {
+        if (!key.includes("_bonus_")) continue;
+        const bonusDateStr = key.split("_")[0];
+        const bonusDate = new Date(bonusDateStr + "T00:00:00");
+        bonusDate.setHours(0, 0, 0, 0);
+        if (bonusDate < todayMidnight && sessionStates[key] === "default") {
+          updates[`sessionStates.${key}`] = "missed";
+        }
+      }
+
+      // Write all updates for this task in a single Firestore call
+      if (Object.keys(updates).length > 0) {
+        try {
+          await updateDoc(
+            doc(db, "users", currentUser.uid, "deadlines", task.id),
+            updates
+          );
+          // Schedule a replacement bonus for each newly missed regular session
+          for (const key of Object.keys(updates)) {
+            if (updates[key] === "missed" && !key.includes("_bonus_")) {
+              await rescheduleAfterMiss(task.id, key);
+            }
+          }
+        } catch (err) {
+          console.error("Auto-miss update failed for task", task.id, err);
+        }
+      }
+    }
+  }
+
   // ── Study plan generation ─────────────────────────────────────
   async function generateStudyPlan() {
     if (!currentUser || currentAvailability.length === 0) return;
@@ -306,7 +471,9 @@
         orderBy("priority", "asc")
       );
 
-      const deadlineSnap = await getDocs(q);
+      // Always read from the server so bonus keys written moments ago
+      // by rescheduleAfterMiss are visible immediately (bypasses local cache).
+      const deadlineSnap = await getDocsFromServer(q);
       const allDeadlines = [];
 
       deadlineSnap.forEach(d => {
@@ -315,6 +482,21 @@
           ...d.data()
         });
       });
+
+      // ── Auto-miss: write "missed" to Firestore for any session whose
+      // time slot has already fully passed and wasn't marked completed.
+      await autoMarkMissedSessions(allDeadlines);
+
+      // Reload fresh data from server so the auto-miss writes above are
+      // reflected in the cards we're about to render.
+      const freshSnap = await getDocsFromServer(q);
+      const freshDeadlines = [];
+      freshSnap.forEach(d => freshDeadlines.push({ id: d.id, ...d.data() }));
+
+      // Replace allDeadlines with freshDeadlines for the rest of the render.
+      // We do this with a reassignment so nothing else in the function changes.
+      allDeadlines.length = 0;
+      freshDeadlines.forEach(d => allDeadlines.push(d));
 
       const startDate = getStartDateOfWeek(weekOffset);
       startDate.setHours(0, 0, 0, 0);
@@ -335,6 +517,14 @@
         "Saturday"
       ];
 
+      // ── Real-time reference ───────────────────────────────────
+      // Sessions are only shown from the current moment onward.
+      // Past days and already-ended slots today are left empty.
+      const realNow = new Date();
+      const todayMidnight = new Date(realNow);
+      todayMidnight.setHours(0, 0, 0, 0);
+      const nowMinutes = realNow.getHours() * 60 + realNow.getMinutes();
+
       const grid = document.getElementById("weekly-plan-grid");
       const columns = grid.querySelectorAll(".weekday-column");
 
@@ -352,6 +542,11 @@
         const oldSlots = columns[colIdx].querySelectorAll(".study-slot");
         oldSlots.forEach(s => s.remove());
 
+        // ── Skip the entire column if the day is before today ─
+        if (currentDayDate < todayMidnight) return;
+
+        const isDayToday = currentDayDate.getTime() === todayMidnight.getTime();
+
         // Find which availability slots apply to this day
         const daySlots = currentAvailability.filter(slot => {
           return slot.day === dayName || slot.day === "Every Day";
@@ -359,18 +554,24 @@
 
         // For each availability slot on this day, divide it among all active tasks
         daySlots.forEach(slot => {
+          const slotStartMinutes = timeToMinutes(slot.from);
+          // Treat 00:00 as midnight end-of-day (1440 min).
+          let slotEndMinutes = timeToMinutes(slot.to);
+          if (slotEndMinutes === 0) slotEndMinutes = 1440;
+          if (slotEndMinutes <= slotStartMinutes) slotEndMinutes += 1440;
+          const slotDuration = slotEndMinutes - slotStartMinutes;
 
-          // Only show tasks whose deadline is still in the future on this day and the student hasn't already marked as Done
+          // ── Skip slots that have already ended today ───────
+          if (isDayToday && slotEndMinutes <= nowMinutes) return;
+
+          // Only show tasks whose deadline is still in the future
+          // on this day and the student hasn't already marked as Done
           const tasksForDay = allDeadlines.filter(task => {
             if (!task.dueDate) return false;
             const dueDate = new Date(task.dueDate);
             dueDate.setHours(0, 0, 0, 0);
             return currentDayDate < dueDate && task.status !== "completed";
           });
-
-          const slotStartMinutes = timeToMinutes(slot.from);
-          const slotEndMinutes = timeToMinutes(slot.to);
-          const slotDuration = slotEndMinutes - slotStartMinutes;
 
           if (slotDuration <= 0 || tasksForDay.length === 0) return;
 
@@ -393,10 +594,27 @@
 
             // Look up the student's recorded state for this session
             const sessionStateMap = task.sessionStates || {};
-            const state = sessionStateMap[sessionKey] || "default";
+            let state = sessionStateMap[sessionKey] || "default";
 
             // Skip this slot if it was reassigned to another deadline
             if (state === "reassigned") return;
+
+            // ── Self-heal: missed sessions with no active bonus ──
+            if (state === "missed") {
+              const courseCode = task.courseCode || "";
+              const hasActiveFutureBonus = Object.keys(sessionStateMap).some(k =>
+                k.includes("_bonus_" + courseCode) &&
+                k.split("_")[0] > dateStr &&
+                sessionStateMap[k] !== "missed"
+              );
+              if (!hasActiveFutureBonus) {
+                updateDoc(
+                  doc(db, "users", currentUser.uid, "deadlines", task.id),
+                  { [`sessionStates.${sessionKey}`]: deleteField() }
+                ).catch(() => {});
+                state = "default";
+              }
+            }
 
             const stateClass = STATE_SLOT_CLASS[state] || "";
 
@@ -411,7 +629,6 @@
               <span class="slot-time">${startTime} - ${endTime}</span>
             `;
 
-            // Clicking the card cycles it to the next state
             sessionDiv.addEventListener("click", () => {
               toggleSessionState(task.id, sessionKey, state);
             });
@@ -429,13 +646,40 @@
 
           // Check if a bonus session exists for this task on this day
           if (bonusKey in sessionStates) {
-            const state = sessionStates[bonusKey];
+            let state = sessionStates[bonusKey];
             if (state === "reassigned") return;
+
+            // ── Self-heal bonus: if this bonus is "missed" with no later active bonus, reset it to default.
+            if (state === "missed") {
+              const bonusDateStr = bonusKey.split("_")[0];
+              const courseCode   = task.courseCode || "";
+              const hasLaterActiveBonus = Object.keys(sessionStates).some(k =>
+                k.includes("_bonus_" + courseCode) &&
+                k.split("_")[0] > bonusDateStr &&
+                sessionStates[k] !== "missed"
+              );
+              if (!hasLaterActiveBonus) {
+                updateDoc(
+                  doc(db, "users", currentUser.uid, "deadlines", task.id),
+                  { [`sessionStates.${bonusKey}`]: deleteField() }
+                ).catch(() => {});
+                state = "default";
+              }
+            }
 
             // Show the time of the first available slot on this day
             const firstSlot = currentAvailability.find(s => {
               return s.day === dayName || s.day === "Every Day";
             });
+
+            // Skip this bonus if its slot has already ended today.
+            if (isDayToday && firstSlot) {
+              let bonusSlotEnd = timeToMinutes(firstSlot.to);
+              if (bonusSlotEnd === 0) bonusSlotEnd = 1440;
+              if (bonusSlotEnd <= timeToMinutes(firstSlot.from)) bonusSlotEnd += 1440;
+              if (bonusSlotEnd <= nowMinutes) return;
+            }
+
             const timeDisplay = firstSlot ? firstSlot.from + " - " + firstSlot.to : "Rescheduled";
 
             const stateClass = STATE_SLOT_CLASS[state] || "";
