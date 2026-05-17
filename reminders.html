@@ -448,7 +448,7 @@
     }
 
     if (document.getElementById("toggle-missed").checked) {
-      // FIX: Only scan past 2 days to avoid flooding with stale missed sessions.
+     
       // Sessions older than 2 days are unlikely to be actionable reminders.
       const MISSED_LOOKBACK_MS = 2 * 24 * 60 * 60 * 1000;
       const missedCutoff = new Date(now.getTime() - MISSED_LOOKBACK_MS);
@@ -461,7 +461,7 @@
 
         const sessionDate = new Date(`${s.date}T${s.startTime || "00:00"}`);
 
-        // FIX: Skip sessions older than the lookback window
+       
         if (sessionDate < missedCutoff) return;
 
         reminders.push({
