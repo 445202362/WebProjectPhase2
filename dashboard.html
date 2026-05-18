@@ -140,6 +140,7 @@
   import {
     collection,
     getDocs,
+    getDocsFromServer,
     doc,
     getDoc,
     query,
@@ -147,7 +148,8 @@
   } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
   import "./auth-guard.js";
 
-  const daysOfWeek = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+  const DAYS_OF_WEEK = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
   const STATE_SLOT_CLASS = {
     default: "",
@@ -155,35 +157,36 @@
     missed: "is-missed"
   };
 
-  function timeToMinutes(time) {
-    if (!time) return 0;
-    const [hours, minutes] = time.split(":").map(Number);
-    return (hours * 60) + minutes;
+  //helper functions
+
+  function timeToMinutes(t) {
+    if (!t) return 0;
+    const [h, m] = t.split(":").map(Number);
+    return h * 60 + m;
   }
 
   function minutesToTime(totalMinutes) {
-    const hours = Math.floor(totalMinutes / 60);
-    const minutes = Math.round(totalMinutes % 60);
-    return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+    // Wrap at 1440 so midnight (1440 min) shows as "00:00"
+    const wrapped = totalMinutes % 1440;
+    const h = Math.floor(wrapped / 60);
+    const m = Math.round(wrapped % 60);
+    return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}`;
   }
 
   function normalizeDate(date) {
     return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
   }
 
-  function getStartDateOfWeek() {
-    const date = new Date();
-    const day = date.getDay();
-    date.setDate(date.getDate() - day);
-    date.setHours(0, 0, 0, 0);
-    return date;
+  // Returns the Sunday of the current week 
+  function getStartDateOfWeek(offset = 0) {
+    const d = new Date();
+    const day = d.getDay();
+    const diff = d.getDate() - day + (offset * 7);
+    return new Date(d.setDate(diff));
   }
 
   function formatDate(date) {
-    return date.toLocaleDateString("en-US", {
-      month: "short",
-      day: "numeric"
-    });
+    return date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
   }
 
   function formatTimeRange(startTime, endTime) {
@@ -193,128 +196,215 @@
   function formatDuration(startTime, endTime) {
     const minutes = timeToMinutes(endTime) - timeToMinutes(startTime);
     if (minutes <= 0) return "—";
-
     const hours = minutes / 60;
     return Number.isInteger(hours)
       ? `${hours} hr${hours > 1 ? "s" : ""}`
       : `${hours.toFixed(1)} hrs`;
   }
 
-  function priorityClass(priority) {
-    const value = String(priority || "medium").toLowerCase();
-
-    if (value.includes("high")) return "high";
-    if (value.includes("low")) return "low";
-    return "medium";
-  }
-
-  function typeBadge(type) {
-    const value = String(type || "assignment").toLowerCase();
-
-    if (value === "exam") {
-      return `<span class="status-badge badge-warning">Exam</span>`;
-    }
-
-    return `<span class="status-badge badge-neutral">Assignment</span>`;
+  function getPriorityClass(priority) {
+    return String(priority || "medium").toLowerCase();
   }
 
   function priorityBadge(priority) {
-    const value = String(priority || "medium").toLowerCase();
-
-    if (value.includes("high")) {
-      return `<span class="status-badge badge-danger">High</span>`;
-    }
-
-    if (value.includes("low")) {
-      return `<span class="status-badge badge-success">Low</span>`;
-    }
-
+    const v = String(priority || "medium").toLowerCase();
+    if (v.includes("high")) return `<span class="status-badge badge-danger">High</span>`;
+    if (v.includes("low"))  return `<span class="status-badge badge-success">Low</span>`;
     return `<span class="status-badge badge-warning">Medium</span>`;
   }
 
-  function sessionStatusBadge(status, sessionDate) {
-    if (status === "completed") {
-      return `<span class="status-badge badge-success">Done</span>`;
-    }
+  function typeBadge(type) {
+    return String(type || "").toLowerCase() === "exam"
+      ? `<span class="status-badge badge-warning">Exam</span>`
+      : `<span class="status-badge badge-neutral">Assignment</span>`;
+  }
 
-    if (status === "missed") {
-      return `<span class="status-badge badge-danger">Missed</span>`;
-    }
-
-    if (sessionDate < new Date()) {
-      return `<span class="status-badge badge-warning">Pending</span>`;
-    }
-
+  function sessionStatusBadge(status, dateTime) {
+    if (status === "completed") return `<span class="status-badge badge-success">Done</span>`;
+    if (status === "missed")    return `<span class="status-badge badge-danger">Missed</span>`;
+    if (dateTime < new Date())  return `<span class="status-badge badge-warning">Pending</span>`;
     return `<span class="status-badge badge-neutral">Upcoming</span>`;
   }
 
   function escapeHTML(value) {
     return String(value ?? "—")
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;")
+      .replaceAll("&", "&amp;").replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;").replaceAll('"', "&quot;")
       .replaceAll("'", "&#039;");
   }
 
-  function buildWeeklySessions(deadlines, availability) {
-    const sessions = [];
-    const startDate = getStartDateOfWeek();
+  // Profile
 
-    daysOfWeek.forEach((dayName, dayIndex) => {
+  async function loadProfile(user) {
+    const fallback = user.displayName || user.email || "Student";
+    setProfileName(fallback);
+    try {
+      const snap = await getDoc(doc(db, "users", user.uid, "profile", "info"));
+      if (snap.exists()) setProfileName(snap.data().firstName || fallback);
+    } catch (e) {
+      console.error("Profile load error:", e);
+    }
+  }
+
+  function setProfileName(name) {
+    const initial = name ? name[0].toUpperCase() : "S";
+    document.getElementById("sidebar-student-name").textContent = name || "Student";
+    document.getElementById("sidebar-student-initial").textContent = initial;
+    document.getElementById("header-initial").textContent = initial;
+  }
+
+  // Main load
+
+  async function loadDashboard(uid) {
+  
+    const availabilitySnap = await getDocs(
+      collection(db, "users", uid, "availability")
+    );
+    const availability = availabilitySnap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+    const deadlinesSnap = await getDocsFromServer(
+      query(collection(db, "users", uid, "deadlines"), orderBy("priority", "asc"))
+    );
+    const deadlines = deadlinesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+    const weeklySessions = buildWeeklySessionsFromStudyPlan(deadlines, availability);
+
+    renderStats(deadlines, weeklySessions);
+    renderTodaySessions(weeklySessions);
+    renderUpcomingDeadlines(deadlines);
+    renderWeeklyPreview(weeklySessions, availability, deadlines);
+  }
+
+  // Session builder mirrors study-plan.html
+ 
+  function buildWeeklySessionsFromStudyPlan(deadlines, availability) {
+    const sessions = [];
+
+    const startDate = getStartDateOfWeek(0); // always current week on dashboard
+    startDate.setHours(0, 0, 0, 0);
+
+    const realNow     = new Date();
+    const todayMidnight = new Date(realNow);
+    todayMidnight.setHours(0, 0, 0, 0);
+    const nowMinutes  = realNow.getHours() * 60 + realNow.getMinutes();
+
+    DAYS_OF_WEEK.forEach((dayName, dayIndex) => {
       const currentDayDate = new Date(startDate);
       currentDayDate.setDate(startDate.getDate() + dayIndex);
       currentDayDate.setHours(0, 0, 0, 0);
 
-      const dateStr = normalizeDate(currentDayDate);
+      // Skip days before today
+      if (currentDayDate < todayMidnight) return;
 
-      const daySlots = availability.filter(slot => {
-        return slot.day === dayName || slot.day === "Every Day";
-      });
+      const isDayToday = currentDayDate.getTime() === todayMidnight.getTime();
+      const dateStr    = normalizeDate(currentDayDate);
+
+      // Regular sessions
+      const daySlots = availability.filter(
+        slot => slot.day === dayName || slot.day === "Every Day"
+      );
 
       daySlots.forEach(slot => {
+        const slotStartMinutes = timeToMinutes(slot.from);
+        let slotEndMinutes = timeToMinutes(slot.to);
+        if (slotEndMinutes === 0) slotEndMinutes = 1440;
+        if (slotEndMinutes <= slotStartMinutes) slotEndMinutes += 1440;
+        const slotDuration = slotEndMinutes - slotStartMinutes;
+
+        // Skip slots that have already ended today
+        if (isDayToday && slotEndMinutes <= nowMinutes) return;
+
+        // Tasks whose deadline is still ahead on this day and not completed
         const tasksForDay = deadlines.filter(task => {
           if (!task.dueDate) return false;
-          if (task.status === "completed") return false;
-
-          const dueDate = new Date(task.dueDate + "T00:00:00");
+          const dueDate = new Date(task.dueDate);
           dueDate.setHours(0, 0, 0, 0);
-
-          return currentDayDate < dueDate;
+          return currentDayDate < dueDate && task.status !== "completed";
         });
 
-        const slotStart = timeToMinutes(slot.from);
-        const slotEnd = timeToMinutes(slot.to);
-        const slotDuration = slotEnd - slotStart;
+        if (slotDuration <= 0 || tasksForDay.length === 0) return;
 
-        if (tasksForDay.length === 0 || slotDuration <= 0) return;
-
-        const minutesPerTask = Math.floor(slotDuration / tasksForDay.length);
+        const minutesPerTask = slotDuration / tasksForDay.length;
 
         tasksForDay.forEach((task, taskIndex) => {
-          const startMinutes = slotStart + (taskIndex * minutesPerTask);
-          const endMinutes = taskIndex === tasksForDay.length - 1
-            ? slotEnd
-            : startMinutes + minutesPerTask;
-
-          const startTime = minutesToTime(startMinutes);
-          const endTime = minutesToTime(endMinutes);
+          const startTime = minutesToTime(slotStartMinutes + taskIndex * minutesPerTask);
+          const endTime   = minutesToTime(slotStartMinutes + (taskIndex + 1) * minutesPerTask);
           const sessionKey = `${dateStr}_${slot.from}_${task.courseCode}`;
-          const status = task.sessionStates?.[sessionKey] || "default";
+
+          const sessionStateMap = task.sessionStates || {};
+          const state = sessionStateMap[sessionKey] || "default";
+
+          // Skip reassigned sessions
+          if (state === "reassigned") return;
+
+          const durationMinutes = Math.round(minutesPerTask);
 
           sessions.push({
-            taskId: task.id,
-            courseCode: task.courseCode || "—",
-            title: task.title || "Study Session",
-            priority: task.priority || "medium",
-            status,
-            date: dateStr,
+            taskId:          task.id,
+            courseCode:      task.courseCode || "—",
+            title:           task.title || "Study Session",
+            priority:        task.priority || "medium",
+            status:          state,
+            date:            dateStr,
             dayName,
             startTime,
             endTime,
-            durationMinutes: endMinutes - startMinutes,
-            dateTime: new Date(`${dateStr}T${startTime}`)
+            durationMinutes,
+            dateTime:        new Date(`${dateStr}T${startTime}`),
+            isBonus:         false
           });
+        });
+      });
+
+      // Bonus sessions
+
+      deadlines.forEach(task => {
+        if (task.status === "completed") return;
+        const sessionStates = task.sessionStates || {};
+        const bonusKey = `${dateStr}_bonus_${task.courseCode}`;
+
+        if (!(bonusKey in sessionStates)) return;
+
+        const state = sessionStates[bonusKey];
+        if (state === "reassigned") return;
+
+        // Show the time of the first available slot on this day
+        const firstSlot = availability.find(
+          s => s.day === dayName || s.day === "Every Day"
+        );
+
+        // Skip if its slot has already ended today
+        if (isDayToday && firstSlot) {
+          let bonusSlotEnd = timeToMinutes(firstSlot.to);
+          if (bonusSlotEnd === 0) bonusSlotEnd = 1440;
+          if (bonusSlotEnd <= timeToMinutes(firstSlot.from)) bonusSlotEnd += 1440;
+          if (bonusSlotEnd <= nowMinutes) return;
+        }
+
+        const startTime = firstSlot ? firstSlot.from : "—";
+        const endTime   = firstSlot ? firstSlot.to   : "—";
+
+        const durationMinutes = firstSlot
+          ? (() => {
+              let e = timeToMinutes(firstSlot.to);
+              if (e === 0) e = 1440;
+              return e - timeToMinutes(firstSlot.from);
+            })()
+          : 0;
+
+        sessions.push({
+          taskId:          task.id,
+          courseCode:      task.courseCode || "—",
+          title:           (task.title || "Study Session") + " ★",
+          priority:        task.priority || "medium",
+          status:          state,
+          date:            dateStr,
+          dayName,
+          startTime,
+          endTime,
+          durationMinutes,
+          dateTime:        new Date(`${dateStr}T${startTime}`),
+          isBonus:         true
         });
       });
     });
@@ -322,176 +412,118 @@
     return sessions;
   }
 
-  async function loadProfile(user) {
-    const fallback = user.displayName || user.email || "Student";
-    setProfileName(fallback);
-
-    try {
-      const profileSnap = await getDoc(doc(db, "users", user.uid, "profile", "info"));
-
-      if (profileSnap.exists()) {
-        const data = profileSnap.data();
-        const name = data.firstName || fallback;
-        setProfileName(name);
-      }
-    } catch (error) {
-      console.error("Profile load error:", error);
-    }
-  }
-
-  function setProfileName(name) {
-    const initial = name ? name[0].toUpperCase() : "S";
-
-    document.getElementById("sidebar-student-name").textContent = name || "Student";
-    document.getElementById("sidebar-student-initial").textContent = initial;
-    document.getElementById("header-initial").textContent = initial;
-  }
-
-  async function loadDashboard(uid) {
-    const [deadlinesSnap, availabilitySnap] = await Promise.all([
-      getDocs(query(collection(db, "users", uid, "deadlines"), orderBy("dueDate", "asc"))),
-      getDocs(collection(db, "users", uid, "availability"))
-    ]);
-
-    const deadlines = deadlinesSnap.docs.map(item => ({
-      id: item.id,
-      ...item.data()
-    }));
-
-    const availability = availabilitySnap.docs.map(item => ({
-      id: item.id,
-      ...item.data()
-    }));
-
-    const weeklySessions = buildWeeklySessions(deadlines, availability);
-
-    renderStats(deadlines, weeklySessions);
-    renderTodaySessions(weeklySessions);
-    renderUpcomingDeadlines(deadlines);
-    renderWeeklyPreview(weeklySessions);
-  }
+  // Render Stats 
 
   function renderStats(deadlines, weeklySessions) {
-    const now = new Date();
-    const sevenDaysLater = new Date(now.getTime() + (7 * 24 * 60 * 60 * 1000));
+    const now           = new Date();
+    const sevenDaysLater = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
 
-    const completedSessions = weeklySessions.filter(session => session.status === "completed");
-    const completedMinutes = completedSessions.reduce((sum, session) => sum + session.durationMinutes, 0);
-    const completionRate = weeklySessions.length === 0
+    const completedSessions = weeklySessions.filter(s => s.status === "completed");
+    const completedMinutes  = completedSessions.reduce((sum, s) => sum + s.durationMinutes, 0);
+    const completionRate    = weeklySessions.length === 0
       ? 0
       : Math.round((completedSessions.length / weeklySessions.length) * 100);
 
-    const upcomingDeadlinesCount = deadlines.filter(deadline => {
-      if (!deadline.dueDate) return false;
-      if (deadline.status === "completed") return false;
-
-      const dueDate = new Date(`${deadline.dueDate}T${deadline.time || "23:59"}`);
-      return dueDate >= now && dueDate <= sevenDaysLater;
+    const upcomingCount = deadlines.filter(d => {
+      if (!d.dueDate || d.status === "completed") return false;
+      const due = new Date(`${d.dueDate}T${d.time || "23:59"}`);
+      return due >= now && due <= sevenDaysLater;
     }).length;
 
-    document.getElementById("hours-this-week").textContent = (completedMinutes / 60).toFixed(1);
-    document.getElementById("completion-rate").textContent = `${completionRate}%`;
-    document.getElementById("upcoming-deadlines-count").textContent = upcomingDeadlinesCount;
+    document.getElementById("hours-this-week").textContent        = (completedMinutes / 60).toFixed(1);
+    document.getElementById("completion-rate").textContent        = `${completionRate}%`;
+    document.getElementById("upcoming-deadlines-count").textContent = upcomingCount;
   }
 
+  // Render Today's Sessions
+
   function renderTodaySessions(weeklySessions) {
-    const tbody = document.getElementById("today-sessions-body");
-    const today = normalizeDate(new Date());
-    const todayName = daysOfWeek[new Date().getDay()];
+    const tbody    = document.getElementById("today-sessions-body");
+    const today    = normalizeDate(new Date());
+    const todayName = DAYS_OF_WEEK[new Date().getDay()];
 
     document.getElementById("today-badge").textContent = todayName;
 
     const todaySessions = weeklySessions
-      .filter(session => session.date === today)
+      .filter(s => s.date === today)
       .sort((a, b) => a.dateTime - b.dateTime);
 
     if (todaySessions.length === 0) {
-      tbody.innerHTML = `
-        <tr>
-          <td colspan="4" class="td-empty">No study sessions scheduled for today.</td>
-        </tr>
-      `;
+      tbody.innerHTML = `<tr><td colspan="4" class="td-empty">No study sessions scheduled for today.</td></tr>`;
       return;
     }
 
-    tbody.innerHTML = todaySessions.map(session => `
+    tbody.innerHTML = todaySessions.map(s => `
       <tr>
-        <td><strong>${escapeHTML(session.courseCode)}</strong></td>
-        <td>${formatTimeRange(session.startTime, session.endTime)}</td>
-        <td>${formatDuration(session.startTime, session.endTime)}</td>
-        <td>${sessionStatusBadge(session.status, session.dateTime)}</td>
+        <td><strong>${escapeHTML(s.courseCode)}</strong></td>
+        <td>${formatTimeRange(s.startTime, s.endTime)}</td>
+        <td>${formatDuration(s.startTime, s.endTime)}</td>
+        <td>${sessionStatusBadge(s.status, s.dateTime)}</td>
       </tr>
     `).join("");
   }
 
+  // Render Upcoming Deadlines 
+
   function renderUpcomingDeadlines(deadlines) {
     const tbody = document.getElementById("upcoming-deadlines-body");
-    const now = new Date();
+    const now   = new Date();
 
     const upcoming = deadlines
-      .filter(deadline => {
-        if (!deadline.dueDate) return false;
-        if (deadline.status === "completed") return false;
-
-        const dueDate = new Date(`${deadline.dueDate}T${deadline.time || "23:59"}`);
-        return dueDate >= now;
+      .filter(d => {
+        if (!d.dueDate || d.status === "completed") return false;
+        return new Date(`${d.dueDate}T${d.time || "23:59"}`) >= now;
       })
-      .sort((a, b) => {
-        const aDate = new Date(`${a.dueDate}T${a.time || "23:59"}`);
-        const bDate = new Date(`${b.dueDate}T${b.time || "23:59"}`);
-        return aDate - bDate;
-      })
+      .sort((a, b) =>
+        new Date(`${a.dueDate}T${a.time || "23:59"}`) -
+        new Date(`${b.dueDate}T${b.time || "23:59"}`)
+      )
       .slice(0, 3);
 
     document.getElementById("deadlines-badge").textContent = `${upcoming.length} due soon`;
 
     if (upcoming.length === 0) {
-      tbody.innerHTML = `
-        <tr>
-          <td colspan="5" class="td-empty">No upcoming deadlines.</td>
-        </tr>
-      `;
+      tbody.innerHTML = `<tr><td colspan="5" class="td-empty">No upcoming deadlines.</td></tr>`;
       return;
     }
 
-    tbody.innerHTML = upcoming.map(deadline => {
-      const dueDate = new Date(`${deadline.dueDate}T00:00:00`);
-
-      return `
-        <tr>
-          <td><strong>${escapeHTML(deadline.courseCode)}</strong></td>
-          <td>${escapeHTML(deadline.title)}</td>
-          <td>${formatDate(dueDate)}</td>
-          <td>${typeBadge(deadline.type)}</td>
-          <td>${priorityBadge(deadline.priority)}</td>
-        </tr>
-      `;
-    }).join("");
+    tbody.innerHTML = upcoming.map(d => `
+      <tr>
+        <td><strong>${escapeHTML(d.courseCode)}</strong></td>
+        <td>${escapeHTML(d.title)}</td>
+        <td>${formatDate(new Date(`${d.dueDate}T00:00:00`))}</td>
+        <td>${typeBadge(d.type)}</td>
+        <td>${priorityBadge(d.priority)}</td>
+      </tr>
+    `).join("");
   }
 
-  function renderWeeklyPreview(weeklySessions) {
-    const grid = document.getElementById("dashboard-weekly-grid");
-    const columns = grid.querySelectorAll(".weekday-column");
-    const startDate = getStartDateOfWeek();
+  // Render Weekly Preview 
 
-    const totalMinutes = weeklySessions.reduce((sum, session) => sum + session.durationMinutes, 0);
+  function renderWeeklyPreview(weeklySessions, availability, deadlines) {
+    const grid      = document.getElementById("dashboard-weekly-grid");
+    const columns   = grid.querySelectorAll(".weekday-column");
+    const startDate = getStartDateOfWeek(0);
+    startDate.setHours(0, 0, 0, 0);
+
+    const totalMinutes = weeklySessions.reduce((sum, s) => sum + s.durationMinutes, 0);
     document.getElementById("weekly-total").textContent = `${(totalMinutes / 60).toFixed(1)} hrs total`;
 
-    daysOfWeek.forEach((dayName, dayIndex) => {
-      const column = columns[dayIndex];
+    DAYS_OF_WEEK.forEach((dayName, dayIndex) => {
+      const column      = columns[dayIndex];
       const currentDate = new Date(startDate);
       currentDate.setDate(startDate.getDate() + dayIndex);
 
       column.innerHTML = `<h4>${dayName.slice(0, 3)}<br><small>${formatDate(currentDate)}</small></h4>`;
 
       const sessionsForDay = weeklySessions
-        .filter(session => session.dayName === dayName)
+        .filter(s => s.dayName === dayName)
         .sort((a, b) => a.dateTime - b.dateTime);
 
       sessionsForDay.forEach(session => {
-        const div = document.createElement("div");
         const stateClass = STATE_SLOT_CLASS[session.status] || "";
-        div.className = `study-slot slot-${priorityClass(session.priority)} ${stateClass}`.trim();
+        const div = document.createElement("div");
+        div.className = `study-slot slot-${getPriorityClass(session.priority)} ${stateClass}`.trim();
         div.innerHTML = `
           <strong>${escapeHTML(session.courseCode)}</strong>
           <span class="slot-time">${escapeHTML(session.title)}</span>
@@ -502,15 +534,15 @@
     });
   }
 
+
   onAuthStateChanged(auth, async (user) => {
     if (!user) return;
-
     await loadProfile(user);
     await loadDashboard(user.uid);
   });
 
-  document.getElementById("logout-btn").addEventListener("click", async (event) => {
-    event.preventDefault();
+  document.getElementById("logout-btn").addEventListener("click", async (e) => {
+    e.preventDefault();
     await signOut(auth);
     window.location.href = "index.html";
   });
